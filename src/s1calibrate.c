@@ -785,8 +785,7 @@ static int calibrate(
     }
     char **options = NULL;
     options = CSLSetNameValue(options, "TILED", "YES");
-    options = CSLSetNameValue(options, "COMPRESS", "DEFLATE");
-    options = CSLSetNameValue(options, "PREDICTOR", "3");
+    options = CSLSetNameValue(options, "COMPRESS", "NONE");
     options = CSLSetNameValue(options, "BIGTIFF", "YES");
     GDALDatasetH output = GDALCreate(
         driver, output_path, width, height, 1, GDT_Float32, options
@@ -801,8 +800,7 @@ static int calibrate(
 
     char **mask_options = NULL;
     mask_options = CSLSetNameValue(mask_options, "TILED", "YES");
-    mask_options = CSLSetNameValue(mask_options, "COMPRESS", "DEFLATE");
-    mask_options = CSLSetNameValue(mask_options, "PREDICTOR", "1");
+    mask_options = CSLSetNameValue(mask_options, "COMPRESS", "NONE");
     mask_options = CSLSetNameValue(mask_options, "BIGTIFF", "YES");
     GDALDatasetH mask = GDALCreate(
         driver, mask_path, width, height, 1, GDT_Byte, mask_options
