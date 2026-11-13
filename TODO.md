@@ -10,8 +10,11 @@ Updated 2026-11-13.
 - [x] 4 s per full VV scene (vs 35.5 s Python).
 - [x] Python frontend auto-discovers C binary (`S1CAL_BIN`, `S1CAL_DISABLE_C=1`).
 - [x] OpenCL kernel source `src/s1calibrate.cl`.
+- [x] CMake target for the C engine; compiled binary untracked and ignored.
+- [x] `JOB.md` with acceptance criteria.
 
 ## Next
+- [ ] Test the CMake engine target in the GRASS build tree.
 - [ ] Host OpenCL integration in `src/s1calibrate.c` behind `--opencl`.
 - [ ] Build kernel with `clBuildProgram`, choose device (`--opencl-device`).
 - [ ] Upload LUT/index/azimuth/dn buffers; enqueue per block; download results.

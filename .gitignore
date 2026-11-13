@@ -8,3 +8,7 @@ venv/
 *.tiff
 *.ovr
 .DS_Store
+
+# Compiled engine
+/s1calibrate
+/src/s1calibrate

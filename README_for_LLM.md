@@ -34,5 +34,5 @@ Python discovers `s1calibrate` via `S1CAL_BIN`, `PATH`, or repo root. Set
 - OpenCL kernel must be benchmarked against CPU; Iris Xe/PoCL is not automatically faster.
 
 ## Next
-See `TODO.md`. Host OpenCL integration is the only missing code path; do not
+See `TODO.md` and `JOB.md`. Host OpenCL integration is the only missing code path; do not
 claim it works until `--opencl` is implemented and compared to the CPU masks.
