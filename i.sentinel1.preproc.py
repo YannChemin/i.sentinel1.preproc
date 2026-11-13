@@ -316,6 +316,63 @@ def _gcp_dataset(path, width, height, dtype, nodata, gcps, gcp_crs):
     return dataset
 
 
+def _find_calibrator():
+    if os.environ.get("S1CAL_DISABLE_C") == "1":
+        return None
+    candidates = [
+        os.environ.get("S1CAL_BIN"),
+        shutil.which("s1calibrate"),
+        str(Path(__file__).resolve().parent / "s1calibrate"),
+        str(Path(__file__).resolve().parent / "bin" / "s1calibrate"),
+    ]
+    for candidate in candidates:
+        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return None
+
+
+def _run_calibrator(
+    binary,
+    source_path,
+    calibration_path,
+    noise_path,
+    output_path,
+    mask_path,
+    lut_name,
+    subtract_noise,
+    memory_mb,
+    threads,
+):
+    command = [
+        binary,
+        "--measurement",
+        _vsicurl(source_path),
+        "--calibration",
+        str(calibration_path),
+        "--noise",
+        str(noise_path),
+        "--output",
+        str(output_path),
+        "--mask",
+        str(mask_path),
+        "--lut",
+        lut_name,
+        "--subtract-noise",
+        "1" if subtract_noise else "0",
+        "--memory-mb",
+        str(memory_mb),
+        "--threads",
+        str(threads),
+    ]
+    gs.debug(" ".join(command))
+    completed = subprocess.run(command, text=True, capture_output=True)
+    if completed.returncode != 0:
+        _fatal(
+            "s1calibrate failed:\n"
+            + (completed.stderr or completed.stdout or "no diagnostic output")
+        )
+
+
 def _write_calibrated(
     source_path,
     calibration_path,
@@ -326,6 +383,34 @@ def _write_calibrated(
     subtract_noise,
     memory_mb,
 ):
+    binary = _find_calibrator()
+    if binary is not None:
+        threads = max(1, min(int(os.cpu_count() or 1), 8))
+        _run_calibrator(
+            binary,
+            source_path,
+            calibration_path,
+            noise_path,
+            output_path,
+            mask_path,
+            lut_name,
+            subtract_noise,
+            memory_mb,
+            threads,
+        )
+        with rasterio.open(output_path) as calibrated, rasterio.open(mask_path) as mask:
+            gcps, gcp_crs = calibrated.gcps
+            core.validate_gcp_count(len(gcps))
+            width, height = calibrated.width, calibrated.height
+        return {
+            "gcp_count": len(gcps),
+            "width": width,
+            "height": height,
+            "block_size": _block_side(memory_mb, width, height),
+            "engine": "c-openmp",
+            "threads": threads,
+        }
+
     calibration = core.parse_calibration(calibration_path)
     if subtract_noise:
         noise = core.parse_noise(noise_path)
@@ -378,6 +463,7 @@ def _write_calibrated(
         "width": width,
         "height": height,
         "block_size": side,
+        "engine": "python",
     }
 
 
