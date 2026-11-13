@@ -538,7 +538,7 @@ def _process_polarisation(
     if flags["d"]:
         expression = (
             f"{db_map} = if({linear_map} > 0, "
-            f"10.0 * log10({linear_map}), {core.DB_FLOOR})"
+            f"4.342944819032518 * log({linear_map}), {core.DB_FLOOR})"
         )
         gs.run_command("r.mapcalc", expression=expression, overwrite=_overwrite())
         maps["db"] = db_map

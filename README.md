@@ -5,8 +5,7 @@ removes thermal noise, geocodes the result to the current region and writes a
 validity mask. It reads either a local GRD `.SAFE` directory or a Planetary
 Computer `sentinel-1-grd` STAC item.
 
-The addon is written for the OlmoEarth Sharjah flood and Dubai RTA retraining
-pipelines. It exists so stage 04 does not depend on SNAP or on an ad-hoc
+The addon exists so the user does not depend on SNAP or on an ad-hoc
 calibration block.
 
 ## Status
