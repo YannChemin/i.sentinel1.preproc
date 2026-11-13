@@ -24,7 +24,9 @@ if(S1CAL_BUILD_ENGINE)
       EXPAT::EXPAT
       OpenMP::OpenMP_C
       m)
-    install(TARGETS s1calibrate RUNTIME DESTINATION bin)
+    set_target_properties(s1calibrate PROPERTIES
+      RUNTIME_OUTPUT_DIRECTORY ${OUTDIR}/${GRASSAddon_BinDIR})
+    install(TARGETS s1calibrate RUNTIME DESTINATION ${GRASSAddon_BinDIR})
     message(STATUS "s1calibrate: C+OpenMP engine enabled")
   else()
     message(WARNING "s1calibrate not built: need GDAL, expat and OpenMP development files")
