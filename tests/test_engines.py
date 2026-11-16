@@ -179,7 +179,9 @@ def scene(tmp_path_factory):
     :returns: a dict with ``dir``, ``measurement``, ``calibration``,
         ``noise`` and ``dn``.
     """
-    gdal = pytest.importorskip("osgeo.gdal", reason="GDAL Python bindings needed")
+    # Called for the skip, not the binding: the module is imported as
+    # gdal_mod just below.
+    pytest.importorskip("osgeo.gdal", reason="GDAL Python bindings needed")
     from osgeo import gdal as gdal_mod
     from osgeo import osr
 
@@ -561,4 +563,30 @@ def test_outside_the_swath_is_nodata_and_noise_clipped_is_zero(scene):
     mask_ds = gdal_mod.Open(str(scene["dir"] / "nodata_semantics_mask.tif"))
     assert mask_ds.GetRasterBand(1).GetNoDataValue() == 255, (
         "mask band must declare 255, so that 0 survives as a real value"
+    )
+
+
+def test_the_db_expression_keeps_the_map_fcell():
+    """The dB map must be FCELL, not DCELL.
+
+    r.mapcalc returns DCELL for an expression like ``log(x) * k``. Exporting a
+    DCELL map as Float32 does not warn and continue: r.out.gdal's data-loss
+    check **aborts** with "Raster export aborted. To override data loss check,
+    use the -f flag", so every scene failed at the export step while the
+    calibration itself was perfectly fine.
+
+    Float32 carries about seven significant digits over a -40 to +10 dB range,
+    four orders of magnitude finer than the measurement means, so wrapping the
+    expression in float() loses nothing real and makes the export exact.
+
+    The alternative, passing -f, would suppress a genuine warning instead of
+    removing its cause, and would silently narrow the values on every export.
+    """
+    source = (ADDON_DIR / "i.sentinel1.preproc.py").read_text()
+    # The dB expression, wherever it sits in the file.
+    start = source.index("4.342944819032518")
+    window = source[max(0, start - 300):start + 200]
+    assert "float(if(" in window, (
+        "the dB r.mapcalc expression must be wrapped in float() so the map is "
+        "FCELL; without it r.out.gdal type=Float32 aborts the export"
     )

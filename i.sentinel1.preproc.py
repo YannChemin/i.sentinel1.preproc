@@ -1089,9 +1089,15 @@ def _process_polarisation(
 
     maps = {"linear": linear_map}
     if flags["d"]:
+        # float() keeps the result FCELL. Without it r.mapcalc returns DCELL,
+        # and exporting that as Float32 trips r.out.gdal's precision-loss
+        # check, which aborts the export rather than warning. Float32 carries
+        # about seven significant digits over a -40 to +10 dB range, which is
+        # four orders of magnitude finer than the measurement means, so the
+        # narrower type loses nothing real and halves the file.
         expression = (
-            f"{db_map} = if({linear_map} > 0, "
-            f"4.342944819032518 * log({linear_map}), {core.DB_FLOOR})"
+            f"{db_map} = float(if({linear_map} > 0, "
+            f"4.342944819032518 * log({linear_map}), {core.DB_FLOOR}))"
         )
         gs.run_command("r.mapcalc", expression=expression, overwrite=_overwrite())
         maps["db"] = db_map
