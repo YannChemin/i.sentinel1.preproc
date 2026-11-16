@@ -1095,9 +1095,19 @@ def _process_polarisation(
         # about seven significant digits over a -40 to +10 dB range, which is
         # four orders of magnitude finer than the measurement means, so the
         # narrower type loses nothing real and halves the file.
+        # max() makes DB_FLOOR an actual floor. Without it the constant was
+        # only the value substituted where the linear band is non-positive,
+        # while a tiny positive linear value -- noise subtraction leaving
+        # signal close to zero -- still took the logarithm and reached -102 dB
+        # on this AOI's VH band, over 1 % of the valid pixels. Gamma0 that low
+        # is physically meaningless (the S1 IW thermal noise floor is around
+        # -22 to -25 dB), and the tail inflated the dry-season baseline's
+        # standard deviation by 1.7 %, which desensitises the Z < -2 rule and
+        # so loses real floods.
         expression = (
             f"{db_map} = float(if({linear_map} > 0, "
-            f"4.342944819032518 * log({linear_map}), {core.DB_FLOOR}))"
+            f"max({core.DB_FLOOR}, 4.342944819032518 * log({linear_map})), "
+            f"{core.DB_FLOOR}))"
         )
         gs.run_command("r.mapcalc", expression=expression, overwrite=_overwrite())
         maps["db"] = db_map

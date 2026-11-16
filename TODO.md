@@ -162,6 +162,31 @@ one, decaying monotonically as the exclusion radius widens.
       `src/Makefile` and must be built there, then installed to
       `~/.grass8/addons/bin/s1calibrate`. A rebuild that skips this step leaves
       the old binary in place and the fix appears not to work.
+- [x] **dB map was DCELL, so every export aborted.** `r.mapcalc` returns DCELL
+      for `log(x) * k`. Exporting that as `type=Float32` does not warn and
+      continue: r.out.gdal's data-loss check **aborts** with "Raster export
+      aborted. To override data loss check, use the -f flag". Every post-2018
+      scene therefore failed at the export step with the calibration itself
+      perfectly fine, and the run produced nothing at all. Fixed by wrapping
+      the expression in `float()`, which is the cause rather than the symptom;
+      passing `-f` would have suppressed a real warning and silently narrowed
+      every export. Float32 carries about seven significant digits over a -40
+      to +10 dB range, four orders of magnitude finer than the measurement
+      means. Pinned by `test_the_db_expression_keeps_the_map_fcell`.
+
+- [x] **DB_FLOOR was not a floor.** The constant was only the value
+      substituted where the linear band is non-positive. A tiny *positive*
+      linear value -- noise subtraction leaving signal near zero -- still took
+      the logarithm, reaching **-74.9 dB on VV and -102.0 dB on VH, 1.03 % of
+      the valid VH pixels**. Gamma0 that low is physically meaningless: the S1
+      IW thermal noise floor is about -22 to -25 dB. Measured cost on one
+      scene: the tail inflated the dB standard deviation by 1.7 %, so a
+      Z < -2 test demanded 0.26 dB more anomaly than it should and would lose
+      real floods; per pixel over a dry-season baseline the effect can be
+      larger than the scene-wide figure. Fixed with
+      `max(DB_FLOOR, 4.342944819032518 * log(linear))`, which also makes the
+      manual's documented floor true. Verified end to end: min is now exactly
+      -40.00 dB with nothing below, on both polarisations.
 
 ## Next
 - [ ] Re-benchmark with 4-8 concurrent scene workers, which is the case where
