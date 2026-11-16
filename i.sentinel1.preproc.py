@@ -334,9 +334,15 @@ def _safe_source(root, polarisation):
 #: resampling, and a GRD band is cheap at this scale, so the margin is generous.
 WINDOW_PAD = 512
 
-#: A second-order inverse fit whose own residual exceeds this many source
-#: pixels is not trusted, and the whole band is read instead.
-WINDOW_MAX_RESIDUAL_PX = 64.0
+#: Polynomial orders tried for the inverse fit, lowest first.
+WINDOW_FIT_ORDERS = (2, 3, 4)
+
+#: The fit is accepted while its own residual on the control points stays
+#: below this share of the margin, so the margin always dominates the fit
+#: error. A real IW GRD scene needs third order: a second-order fit over a
+#: 250 km swath left 98 source pixels of residual, which at 512 px of margin
+#: is safe but not comfortable, and at a smaller margin would not be.
+WINDOW_RESIDUAL_FRACTION_OF_PAD = 0.25
 
 
 def _source_window(measurement_path, region, pad=WINDOW_PAD):
@@ -351,10 +357,11 @@ def _source_window(measurement_path, region, pad=WINDOW_PAD):
     The scene has no geotransform, only a grid of ground control points, so the
     window is found by fitting a second-order polynomial from longitude and
     latitude to source pixel and line over those points and evaluating it at
-    the region's boundary. The fit's own residual on the control points is
-    checked: a scene whose geometry this cannot describe falls back to the whole
-    band with a warning, rather than silently returning a window in the wrong
-    place.
+    the region's boundary, trying increasing polynomial orders and taking the
+    lowest one whose own residual on the control points stays well inside the
+    margin. A scene whose geometry none of them describes falls back to the
+    whole band with a warning, rather than silently returning a window in the
+    wrong place.
 
     :param measurement_path: The measurement band, local or ``/vsicurl/``.
     :param region: The current region, as :func:`_region` returns it.
@@ -379,26 +386,47 @@ def _source_window(measurement_path, region, pad=WINDOW_PAD):
     lon_s = max(float(np.ptp(lon)), 1e-6)
     lat_s = max(float(np.ptp(lat)), 1e-6)
 
-    def design(a, b):
+    def design(a, b, order):
+        """Polynomial terms up to ``order`` in the scaled coordinates."""
         u = (a - lon0) / lon_s
         v = (b - lat0) / lat_s
         return np.column_stack(
-            [np.ones_like(u), u, v, u * u, u * v, v * v]
+            [u**i * v**j for d in range(order + 1) for i, j in
+             ((d - k, k) for k in range(d + 1))]
         )
 
-    matrix = design(lon, lat)
-    col_fit, *_ = np.linalg.lstsq(matrix, col, rcond=None)
-    row_fit, *_ = np.linalg.lstsq(matrix, row, rcond=None)
-    residual = max(
-        np.abs(matrix @ col_fit - col).max(), np.abs(matrix @ row_fit - row).max()
-    )
-    if residual > WINDOW_MAX_RESIDUAL_PX:
+    # The lowest order that describes the geometry is used: a higher order
+    # follows the control points more closely but is freer to misbehave between
+    # them, and the margin has to cover whichever error is left.
+    limit = pad * WINDOW_RESIDUAL_FRACTION_OF_PAD
+    chosen = None
+    for order in WINDOW_FIT_ORDERS:
+        matrix = design(lon, lat, order)
+        if matrix.shape[0] < matrix.shape[1] + 3:
+            break  # Not enough control points to constrain this order.
+        col_fit, *_ = np.linalg.lstsq(matrix, col, rcond=None)
+        row_fit, *_ = np.linalg.lstsq(matrix, row, rcond=None)
+        residual = max(
+            float(np.abs(matrix @ col_fit - col).max()),
+            float(np.abs(matrix @ row_fit - row).max()),
+        )
+        gs.verbose(
+            f"inverse GCP fit order {order}: residual {residual:.1f} source pixels"
+        )
+        if residual <= limit:
+            chosen = (order, col_fit, row_fit, residual)
+            break
+    if chosen is None:
         gs.warning(
-            f"inverse GCP fit residual is {residual:.0f} px, above the "
-            f"{WINDOW_MAX_RESIDUAL_PX:.0f} px limit; reading the whole band"
+            f"no inverse GCP fit up to order {WINDOW_FIT_ORDERS[-1]} stayed "
+            f"within {limit:.0f} px of the {pad} px margin; reading the "
+            "whole band"
         )
         return None
-    gs.verbose(f"inverse GCP fit residual: {residual:.1f} source pixels")
+    order, col_fit, row_fit, residual = chosen
+    gs.verbose(
+        f"inverse GCP fit: order {order}, residual {residual:.1f} source pixels"
+    )
 
     # The region boundary is sampled, not just cornered: in the scene's own
     # geometry a projected rectangle is a curved quadrilateral, so its extreme
@@ -414,7 +442,7 @@ def _source_window(measurement_path, region, pad=WINDOW_PAD):
     lon_edge, lat_edge = warp_transform(
         region_crs, gcp_crs, edge_x.tolist(), edge_y.tolist()
     )
-    probe = design(np.asarray(lon_edge), np.asarray(lat_edge))
+    probe = design(np.asarray(lon_edge), np.asarray(lat_edge), order)
     cols = probe @ col_fit
     rows = probe @ row_fit
 
@@ -732,9 +760,11 @@ def _write_calibrated(
         ]
         side = _block_side(memory_mb, width, height)
         calibrated = _gcp_dataset(
-            output_path, width, height, "float32", 0, shifted, gcp_crs
+            output_path, width, height, "float32", float("nan"), shifted, gcp_crs
         )
-        mask = _gcp_dataset(mask_path, width, height, "uint8", 0, shifted, gcp_crs)
+        mask = _gcp_dataset(
+            mask_path, width, height, "uint8", 255, shifted, gcp_crs
+        )
         try:
             for row in range(0, height, side):
                 rows = min(side, height - row)
@@ -773,7 +803,17 @@ def _write_calibrated(
     }
 
 
-def _warp(source_path, target_path, region, resample, nprocs, dtype):
+def _warp(source_path, target_path, region, resample, nprocs, dtype, nodata):
+    """Warp one calibrated raster onto the current region.
+
+    ``nodata`` must be a value the calibration cannot produce. It used to be
+    hard-coded to 0 for both rasters, which silently destroyed the validity
+    mask: the engines write 0 for an invalid pixel, so every one of them became
+    nodata and the delivered mask could only ever contain 1. The float raster
+    now uses NaN and the mask 255.
+
+    :param nodata: Source and destination nodata value.
+    """
     predictor = "3" if dtype == "float32" else "1"
     command = [
         "gdalwarp",
@@ -795,9 +835,9 @@ def _warp(source_path, target_path, region, resample, nprocs, dtype):
         "-order",
         "1",
         "-srcnodata",
-        "0",
+        str(nodata),
         "-dstnodata",
-        "0",
+        str(nodata),
         "-multi",
         "-wo",
         f"NUM_THREADS={nprocs}",
@@ -942,6 +982,7 @@ def _process_polarisation(
         "bilinear",
         int(options["nprocs"]),
         "float32",
+        "nan",
     )
     _import_raster(warped_path, linear_map)
 
@@ -962,6 +1003,7 @@ def _process_polarisation(
             "near",
             int(options["nprocs"]),
             "uint8",
+            "255",
         )
         _import_raster(warped_mask, mask_map)
         _border_mask(mask_map, int(options["border"]), region)

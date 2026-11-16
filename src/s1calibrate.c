@@ -1558,6 +1558,15 @@ static int calibrate(
     }
     GDALRasterBandH output_band = GDALGetRasterBand(output, 1);
     GDALRasterBandH mask_band = GDALGetRasterBand(mask, 1);
+    /* NaN for the float band and 255 for the mask: neither can be produced by
+     * the calibration, so nodata never collides with a measurement. 0 in the
+     * mask means "invalid", which is information, not absence of data. */
+    if (GDALSetRasterNoDataValue(output_band, (double)NAN) != CE_None) {
+        die("cannot set nodata on calibrated raster");
+    }
+    if (GDALSetRasterNoDataValue(mask_band, 255.0) != CE_None) {
+        die("cannot set nodata on mask raster");
+    }
 
     int side = block_side(memory_mb, width, height);
     size_t block_pixels = (size_t)side * (size_t)side;
@@ -1726,10 +1735,21 @@ static int calibrate(
                     if (signal < 0.0) {
                         signal = 0.0;
                     }
-                    double calibrated = signal / (cal_value * cal_value);
-                    linear[base + (size_t)c] = (float)calibrated;
-                    valid[base + (size_t)c] =
-                        (value > 0.0 && signal > 0.0) ? (uint8_t)1 : (uint8_t)0;
+                    if (value <= 0.0) {
+                        /* DN 0 is outside the swath, not a measurement of zero
+                         * backscatter. It is written as NaN, the band's nodata,
+                         * so that the warp can drop it while a pixel the noise
+                         * subtraction drove to the floor stays a real 0 and
+                         * reaches the dB floor instead of becoming nodata. */
+                        linear[base + (size_t)c] = NAN;
+                        valid[base + (size_t)c] = (uint8_t)0;
+                    }
+                    else {
+                        linear[base + (size_t)c] =
+                            (float)(signal / (cal_value * cal_value));
+                        valid[base + (size_t)c] =
+                            (signal > 0.0) ? (uint8_t)1 : (uint8_t)0;
+                    }
                 }
             }
             }

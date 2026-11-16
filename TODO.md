@@ -59,6 +59,20 @@ Updated 2026-11-14.
       automatic in the module, recorded in the provenance JSON.
 - [x] `cache=` option: download whole bands to a directory instead, reusing a
       file already present at the expected size (HEAD, not GET).
+- [x] **Fixed a defect that made the delivered mask useless.** The engines
+      wrote 0 both for a DN of 0 (outside the swath) and for a pixel the noise
+      subtraction drove to the floor, and `_warp` used `-srcnodata 0` for both
+      rasters, so every invalid pixel became nodata: the first real end-to-end
+      product had a VV mask of 25,701,142 cells all equal to 1, with not one 0,
+      and 3.48 M VH pixels (13.5 %) silently null instead of at the noise
+      floor. The dB floor of -40 was unreachable for the same reason. Now
+      outside the swath is NaN / 255 and declared as the band nodata, while a
+      noise-clipped pixel keeps a real 0 in all three engines and reaches the
+      dB floor. Pinned by `test_outside_the_swath_is_nodata_and_noise_clipped_is_zero`.
+- [x] Inverse GCP fit tries orders 2, 3, 4 and takes the lowest whose residual
+      stays under a quarter of the margin. Order 2 left 98 px of residual on a
+      real IW scene, which tripped the old fixed 64 px limit and fell back to
+      the whole band.
 
 ### Why the window matters more than any engine choice
 

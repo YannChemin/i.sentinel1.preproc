@@ -11,8 +11,13 @@ The measurement is raw uint16 digital numbers with WGS84 ground control points
 and no CRS.
 
 The output is a Float32 linear-power map, an optional dB map and an optional
-uint8 mask. The dB floor is -40 dB. Pixels at or below the thermal-noise floor
-are written at the floor and marked invalid in the mask.
+uint8 mask. Pixels outside the swath are nodata: NaN in the Float32 raster, 255
+in the mask. A pixel at or below the thermal-noise floor is **not** nodata; it
+carries a real 0 in the linear map, the dB floor of -40 dB in the dB map, and 0
+in the mask. The two cases are kept apart deliberately, because conflating them
+makes the mask useless: an earlier version wrote 0 for both and warped with
+`-srcnodata 0`, so every invalid pixel became nodata and the delivered mask
+contained the value 1 and nothing else.
 
 ## NOTES
 
@@ -132,7 +137,8 @@ For **output=s1_20240427**, **polarisations=vv** and **calibration=gamma0**:
 : dB gamma0, written with **-d**
 
 `s1_20240427_vv_gamma0_mask`
-: 1 valid, 0 invalid, written with **-m**
+: 1 valid, 0 at or below the noise floor, 255 (nodata) outside the swath;
+  written with **-m**
 
 `s1_20240427_group`
 : group containing all polarisation maps

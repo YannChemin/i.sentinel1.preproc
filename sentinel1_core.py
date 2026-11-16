@@ -373,6 +373,11 @@ def calibrate_block(
     linear = np.where(np.isfinite(linear), linear, 0.0)
     linear = np.maximum(linear, 0.0)
     valid &= np.isfinite(linear)
+    # DN 0 is outside the swath, not a measurement of zero backscatter, so it
+    # is no data. A pixel the noise subtraction drove to zero keeps a real 0
+    # and reaches the dB floor; conflating the two made the validity mask
+    # unable to report anything but 1, because the warp treated 0 as nodata.
+    linear = np.where(dn > 0.0, linear, np.nan)
 
     return linear.astype(np.float32), valid.astype(np.uint8)
 

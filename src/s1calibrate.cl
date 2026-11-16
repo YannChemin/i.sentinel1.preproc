@@ -85,6 +85,14 @@ __kernel void s1calibrate(
     if (signal < 0.0f) {
         signal = 0.0f;
     }
-    linear[p] = signal / (cv * cv);
-    valid[p] = (d > 0u && signal > 0.0f) ? (uchar)1 : (uchar)0;
+    if (d == 0u) {
+        /* Outside the swath: no data, as distinct from a pixel the noise
+         * subtraction drove to zero, which stays a real 0. */
+        linear[p] = NAN;
+        valid[p] = (uchar)0;
+    }
+    else {
+        linear[p] = signal / (cv * cv);
+        valid[p] = (signal > 0.0f) ? (uchar)1 : (uchar)0;
+    }
 }

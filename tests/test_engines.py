@@ -107,8 +107,16 @@ def _report_difference(label, a, b):
 
     :returns: ``(max_abs, max_rel)`` over the pixels where ``b`` is non-zero.
     """
-    diff = np.abs(a.astype(np.float64) - b.astype(np.float64))
-    nonzero = b > 0.0
+    a = a.astype(np.float64)
+    b = b.astype(np.float64)
+    # Both engines write NaN outside the swath, so NaN against NaN is agreement,
+    # not a difference. NaN in only one of them is a real disagreement and must
+    # stay visible, so it is reported as infinite rather than dropped.
+    both_nan = np.isnan(a) & np.isnan(b)
+    one_nan = np.isnan(a) ^ np.isnan(b)
+    diff = np.abs(np.where(both_nan, 0.0, a - b))
+    diff = np.where(one_nan, np.inf, diff)
+    nonzero = np.nan_to_num(b) > 0.0
     rel = np.zeros_like(diff)
     rel[nonzero] = diff[nonzero] / b[nonzero]
     max_abs = float(diff.max())
@@ -460,8 +468,15 @@ def test_window_matches_the_same_region_of_the_whole_band(scene):
     expected_valid = full_valid[y0 : y0 + h, x0 : x0 + w]
     _report_difference("window vs full band", win_linear, expected)
     # Identical arithmetic on identical inputs, so this one is exact.
-    assert np.array_equal(win_linear, expected), "windowed values differ"
+    # equal_nan, because the border of the swath is NaN in both and NaN is not
+    # equal to itself. The mask is integer, so it compares directly.
+    assert np.array_equal(win_linear, expected, equal_nan=True), (
+        "windowed values differ"
+    )
     assert np.array_equal(win_valid, expected_valid), "windowed mask differs"
+    assert np.isnan(win_linear).sum() == np.isnan(expected).sum(), (
+        "the windowed and full runs disagree on which pixels are nodata"
+    )
 
     # The GCPs must move with the window, or the warp would place the subset
     # where the full scene used to be.
@@ -499,3 +514,51 @@ def test_window_is_rejected_when_it_misses_the_band(scene):
     assert result.returncode != 0, "a window past the edge of the band was accepted"
     assert "outside the measurement raster" in result.stderr, result.stderr
     assert binary is not None
+
+
+def test_outside_the_swath_is_nodata_and_noise_clipped_is_zero(scene):
+    """The two reasons a pixel is invalid must stay distinguishable.
+
+    This is the defect the first real end-to-end run exposed. The engines used
+    to write 0 both for a DN of 0, which is outside the swath, and for a pixel
+    the noise subtraction drove to the floor. ``gdalwarp`` was then called with
+    ``-srcnodata 0`` for both rasters, so every invalid pixel became nodata and
+    the delivered validity mask could only ever contain the value 1 -- over 25
+    million pixels of it, with not one 0. The dB floor was unreachable for the
+    same reason.
+
+    So: outside the swath is NaN in the float raster and 255 in the mask, both
+    declared as the band's nodata; a noise-clipped pixel is a real 0 in the
+    float raster and a real 0 in the mask, which is information and must
+    survive the warp.
+    """
+    from osgeo import gdal as gdal_mod
+
+    binary = _binary()
+    linear, valid, _ = _run(binary, scene, "nodata_semantics")
+
+    dn = scene["dn"]
+    border = dn == 0
+    assert border.any(), "the synthetic scene has no DN 0 pixels to test with"
+
+    assert np.isnan(linear[border]).all(), "outside the swath is not NaN"
+    assert np.array_equal(valid[border], np.full(border.sum(), 0, dtype=valid.dtype)), (
+        "outside the swath is not marked invalid"
+    )
+    assert not np.isnan(linear[~border]).any(), "a measured pixel came out NaN"
+
+    clipped = (~border) & (valid == 0)
+    assert clipped.any(), "the synthetic scene has no noise-clipped pixels"
+    assert (linear[clipped] == 0.0).all(), (
+        "a noise-clipped pixel is not a real 0, so it cannot reach the dB floor"
+    )
+
+    dataset = gdal_mod.Open(str(scene["dir"] / "nodata_semantics.tif"))
+    declared = dataset.GetRasterBand(1).GetNoDataValue()
+    assert declared is not None and np.isnan(declared), (
+        f"calibrated band declares nodata {declared}, not NaN"
+    )
+    mask_ds = gdal_mod.Open(str(scene["dir"] / "nodata_semantics_mask.tif"))
+    assert mask_ds.GetRasterBand(1).GetNoDataValue() == 255, (
+        "mask band must declare 255, so that 0 survives as a real value"
+    )

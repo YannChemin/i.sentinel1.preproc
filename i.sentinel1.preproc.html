@@ -10,9 +10,14 @@ reads the measurement asset and the per-polarisation calibration and noise XML
 assets. The measurement is raw uint16 digital numbers with WGS84 ground
 control points and no CRS.
 
-The output is a Float32 linear-power map, an optional dB map and an optional
-uint8 mask. The dB floor is -40 dB. Pixels at or below the thermal-noise floor
-are written at the floor and marked invalid in the mask.
+<p>The output is a Float32 linear-power map, an optional dB map and an optional
+uint8 mask. Pixels outside the swath are nodata: NaN in the Float32 raster, 255
+in the mask. A pixel at or below the thermal-noise floor is <b>not</b> nodata;
+it carries a real 0 in the linear map, the dB floor of -40 dB in the dB map, and
+0 in the mask. The two cases are kept apart deliberately, because conflating
+them makes the mask useless: an earlier version wrote 0 for both and warped with
+<tt>-srcnodata 0</tt>, so every invalid pixel became nodata and the delivered
+mask contained the value 1 and nothing else.</p>
 
 <h2>NOTES</h2>
 
@@ -140,7 +145,8 @@ For <tt>output=s1_20240427</tt>, <tt>polarisations=vv</tt> and
 <dt><tt>s1_20240427_vv_gamma0_dB</tt></dt>
 <dd>dB gamma0, written with <b>-d</b></dd>
 <dt><tt>s1_20240427_vv_gamma0_mask</tt></dt>
-<dd>1 valid, 0 invalid, written with <b>-m</b></dd>
+<dd>1 valid, 0 at or below the noise floor, 255 (nodata) outside the swath;
+written with <b>-m</b></dd>
 <dt><tt>s1_20240427_group</tt></dt>
 <dd>group containing all polarisation maps</dd>
 </dl>
