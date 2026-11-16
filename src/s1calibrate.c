@@ -1405,6 +1405,15 @@ static void cl_engine_free(ClEngine *e)
 
 #endif /* S1CAL_HAVE_OPENCL */
 
+/* Move GCPs from source pixel coordinates into window coordinates. */
+static void shift_gcps(GDAL_GCP *gcps, int count, int off_x, int off_y)
+{
+    for (int i = 0; i < count; i++) {
+        gcps[i].dfGCPPixel -= (double)off_x;
+        gcps[i].dfGCPLine -= (double)off_y;
+    }
+}
+
 static int calibrate(
     const char *measurement_path,
     const char *calibration_path,
@@ -1418,7 +1427,11 @@ static int calibrate(
     int use_opencl,
     int opencl_device,
     const char *opencl_profile,
-    int opencl_timing
+    int opencl_timing,
+    int win_x,
+    int win_y,
+    int win_w,
+    int win_h
 )
 {
 #ifndef S1CAL_HAVE_OPENCL
@@ -1463,8 +1476,40 @@ static int calibrate(
     if (GDALGetRasterDataType(source_band) != GDT_UInt16) {
         die("measurement raster is not uint16");
     }
-    int width = GDALGetRasterXSize(source);
-    int height = GDALGetRasterYSize(source);
+    int src_width = GDALGetRasterXSize(source);
+    int src_height = GDALGetRasterYSize(source);
+
+    /* The window is the part of the swath the caller actually needs. An IW GRD
+     * band is about 250 km square while a city-scale area of interest is a few
+     * tens of kilometres, so reading the whole band moves roughly 25 times more
+     * data than the product requires. Everything below indexes the calibration
+     * and noise LUTs by absolute source line and pixel, so a window is only a
+     * matter of adding the offset; the LUT values themselves do not move. */
+    int off_x = win_x > 0 ? win_x : 0;
+    int off_y = win_y > 0 ? win_y : 0;
+    if (off_x >= src_width || off_y >= src_height) {
+        die("window origin is outside the measurement raster");
+    }
+    int width = win_w > 0 ? win_w : src_width - off_x;
+    int height = win_h > 0 ? win_h : src_height - off_y;
+    if (off_x + width > src_width) {
+        width = src_width - off_x;
+    }
+    if (off_y + height > src_height) {
+        height = src_height - off_y;
+    }
+    if (width <= 0 || height <= 0) {
+        die("window does not overlap the measurement raster");
+    }
+    if (width != src_width || height != src_height) {
+        fprintf(
+            stderr,
+            "s1calibrate: window %d+%d x %d+%d of %d x %d (%.1f %% of the band)\n",
+            width, off_x, height, off_y, src_width, src_height,
+            100.0 * ((double)width * height) / ((double)src_width * src_height)
+        );
+    }
+
     int gcp_count = GDALGetGCPCount(source);
     if (gcp_count < 6) {
         die("measurement raster has fewer than six GCPs");
@@ -1486,7 +1531,12 @@ static int calibrate(
     if (output == NULL) {
         die("cannot create calibrated raster");
     }
+    /* The GCPs are expressed in source pixel coordinates, so a window shifts
+     * them by its origin. They are kept whole rather than culled to the window:
+     * gdalwarp accepts GCPs outside the raster, and dropping the distant ones
+     * would change the polynomial that every earlier product was warped with. */
     GDAL_GCP *output_gcps = GDALDuplicateGCPs(gcp_count, source_gcps);
+    shift_gcps(output_gcps, gcp_count, off_x, off_y);
     if (GDALSetGCPs(output, gcp_count, output_gcps, gcp_projection) != CE_None) {
         die("cannot set GCPs on calibrated raster");
     }
@@ -1502,6 +1552,7 @@ static int calibrate(
         die("cannot create mask raster");
     }
     GDAL_GCP *mask_gcps = GDALDuplicateGCPs(gcp_count, source_gcps);
+    shift_gcps(mask_gcps, gcp_count, off_x, off_y);
     if (GDALSetGCPs(mask, gcp_count, mask_gcps, gcp_projection) != CE_None) {
         die("cannot set GCPs on mask raster");
     }
@@ -1564,8 +1615,8 @@ static int calibrate(
             if (GDALRasterIO(
                     source_band,
                     GF_Read,
-                    col,
-                    row,
+                    off_x + col,
+                    off_y + row,
                     cols,
                     rows,
                     dn,
@@ -1581,7 +1632,7 @@ static int calibrate(
                 find_interval(
                     cal.pixels,
                     cal.npix,
-                    (double)(col + c),
+                    (double)(off_x + col + c),
                     &cal_pi0[c],
                     &cal_pi1[c],
                     &cal_pt[c]
@@ -1589,13 +1640,13 @@ static int calibrate(
                 find_interval(
                     noise.pixels,
                     noise.npix,
-                    (double)(col + c),
+                    (double)(off_x + col + c),
                     &noise_pi0[c],
                     &noise_pi1[c],
                     &noise_pt[c]
                 );
             }
-            fill_azimuth(&noise, row, col, cols, rows, azimuth);
+            fill_azimuth(&noise, off_y + row, off_x + col, cols, rows, azimuth);
 
 #ifdef S1CAL_HAVE_OPENCL
             if (use_opencl) {
@@ -1611,10 +1662,12 @@ static int calibrate(
                     int ci0, ci1, ni0, ni1;
                     double ct, nt;
                     find_interval(
-                        cal.lines, cal.nlines, (double)(row + r), &ci0, &ci1, &ct
+                        cal.lines, cal.nlines, (double)(off_y + row + r),
+                        &ci0, &ci1, &ct
                     );
                     find_interval(
-                        noise.lines, noise.nlines, (double)(row + r), &ni0, &ni1, &nt
+                        noise.lines, noise.nlines, (double)(off_y + row + r),
+                        &ni0, &ni1, &nt
                     );
                     engine.h_cal_row0[r] = ci0;
                     engine.h_cal_row1[r] = ci1;
@@ -1640,7 +1693,7 @@ static int calibrate(
             if (!use_opencl) {
             #pragma omp parallel for schedule(static)
             for (int r = 0; r < rows; r++) {
-                int line = row + r;
+                int line = off_y + row + r;
                 int ci0, ci1;
                 double ct;
                 find_interval(cal.lines, cal.nlines, (double)line, &ci0, &ci1, &ct);
@@ -1768,6 +1821,8 @@ static void usage(void)
         "  --profile auto|cpu|igpu|dgpu|egpu\n"
         "                                device profile; auto detects it\n"
         "  --opencl-timing               report transfer and kernel time\n"
+        "  --window X,Y,W,H              calibrate only this source window;\n"
+        "                                the default is the whole band\n"
         "  --version                     print version\n"
         "\n"
         "The OpenCL engine works in single precision and the CPU engine in\n"
@@ -1792,6 +1847,7 @@ int main(int argc, char **argv)
     int opencl_device = -1;
     const char *opencl_profile = "auto";
     int opencl_timing = getenv("S1CAL_OPENCL_PROFILE") != NULL;
+    int win_x = 0, win_y = 0, win_w = 0, win_h = 0;
 
     static const struct option long_options[] = {
         {"measurement", required_argument, NULL, 'm'},
@@ -1808,6 +1864,7 @@ int main(int argc, char **argv)
         {"opencl-list", no_argument, NULL, 'L'},
         {"profile", required_argument, NULL, 'p'},
         {"opencl-timing", no_argument, NULL, 'T'},
+        {"window", required_argument, NULL, 'W'},
         {"version", no_argument, NULL, 'v'},
         {"help", no_argument, NULL, 'h'},
         {NULL, 0, NULL, 0}
@@ -1842,6 +1899,15 @@ int main(int argc, char **argv)
                 break;
             case 't':
                 threads = atoi(optarg);
+                break;
+            case 'W':
+                if (sscanf(optarg, "%d,%d,%d,%d", &win_x, &win_y, &win_w, &win_h)
+                    != 4) {
+                    die("--window takes X,Y,W,H");
+                }
+                if (win_x < 0 || win_y < 0 || win_w <= 0 || win_h <= 0) {
+                    die("--window needs a non-negative origin and a positive size");
+                }
                 break;
             case 'O':
                 use_opencl = 1;
@@ -1910,6 +1976,10 @@ int main(int argc, char **argv)
         use_opencl,
         opencl_device,
         opencl_profile,
-        opencl_timing
+        opencl_timing,
+        win_x,
+        win_y,
+        win_w,
+        win_h
     );
 }
