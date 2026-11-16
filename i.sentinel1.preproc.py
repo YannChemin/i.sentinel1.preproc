@@ -110,6 +110,37 @@
 # %end
 
 # %option
+# % key: engine
+# % type: string
+# % required: no
+# % multiple: no
+# % answer: auto
+# % options: auto,c,opencl,python
+# % description: Calibration engine; auto prefers the C+OpenMP binary and falls back to the Python reference
+# % guisection: Performance
+# %end
+
+# %option
+# % key: profile
+# % type: string
+# % required: no
+# % multiple: no
+# % answer: auto
+# % options: auto,cpu,igpu,dgpu,egpu
+# % description: OpenCL device profile; auto detects it from the device
+# % guisection: Performance
+# %end
+
+# %option
+# % key: opencl_device
+# % type: integer
+# % required: no
+# % multiple: no
+# % description: OpenCL device index as listed by s1calibrate --opencl-list
+# % guisection: Performance
+# %end
+
+# %option
 # % key: resolution
 # % type: double
 # % required: no
@@ -125,6 +156,16 @@
 # % multiple: no
 # % description: Directory for the provenance JSON
 # % guisection: Output
+# %end
+
+# %option
+# % key: cache
+# % type: string
+# % required: no
+# % multiple: no
+# % label: Directory for the downloaded measurement and annotation files
+# % description: Default: a temporary directory removed at the end of the run
+# % guisection: Performance
 # %end
 
 # %flag
@@ -153,6 +194,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import warnings
 from datetime import datetime
 from pathlib import Path
@@ -165,7 +207,14 @@ from rasterio.windows import Window
 
 import grass.script as gs
 
-import sentinel1_core as core
+try:
+    # Running from the source directory, which Python puts on sys.path itself.
+    import sentinel1_core as core
+except ImportError:
+    # Installed: the module lives in $GISBASE/etc/i.sentinel1.preproc/ or in the
+    # same directory under GRASS_ADDON_BASE, which set_path() locates.
+    gs.utils.set_path(modulename="i.sentinel1.preproc")
+    import sentinel1_core as core
 
 MODULE = "i.sentinel1.preproc"
 VERSION = "0.1.0"
@@ -280,6 +329,85 @@ def _safe_source(root, polarisation):
     return measurement, calibration, noise, _source_time_from_manifest(root / "manifest.safe")
 
 
+def _stage_asset(href, destination, label):
+    """Download one remote asset to a local file, with retries.
+
+    The measurement band is not read over ``/vsicurl/``. A Sentinel-1 GRD band
+    is about 1 GB of tiled GeoTIFF, and reading it tile by tile over HTTPS took
+    48 minutes on this AOI, by which time the Planetary Computer's signed URL
+    had expired: Azure then answered the remaining range requests with partial
+    bodies and GDAL failed with ``TIFFReadEncodedTile() failed``. A signed URL
+    is valid for about an hour, so the only safe pattern is to fetch the whole
+    asset sequentially, well inside that window, and calibrate from disk.
+
+    A file already present with the expected size is kept, so ``cache=`` makes
+    a re-run cheap and a failed run resumable at scene granularity.
+
+    :param href: The signed asset URL.
+    :param destination: Local path to write.
+    :param label: Short name used in the progress messages.
+    :returns: The local path.
+    """
+    import requests
+
+    destination = Path(destination)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    # A cached asset is settled with a HEAD, so a re-run does not make the
+    # server start sending a gigabyte that is already on disk.
+    if destination.is_file():
+        try:
+            head = requests.head(href, timeout=60, allow_redirects=True)
+            size = int(head.headers.get("Content-Length") or 0)
+            if size and destination.stat().st_size == size:
+                gs.verbose(f"{label}: cached, {size} bytes")
+                return destination
+        except Exception as exc:  # noqa: BLE001 - the download below retries
+            gs.verbose(f"{label}: cache check failed ({exc}); downloading")
+
+    attempts = 4
+    for attempt in range(1, attempts + 1):
+        try:
+            with requests.get(href, stream=True, timeout=120) as response:
+                response.raise_for_status()
+                expected = int(response.headers.get("Content-Length") or 0)
+                # Written beside the destination and renamed, so an interrupted
+                # download can never be mistaken for a complete asset.
+                partial = destination.with_name(destination.name + ".part")
+                received = 0
+                last_percent = -1
+                with open(partial, "wb") as handle:
+                    for chunk in response.iter_content(chunk_size=4 << 20):
+                        handle.write(chunk)
+                        received += len(chunk)
+                        if expected:
+                            percent = int(100 * received / expected)
+                            if percent != last_percent:
+                                # Progress is reported to MetaMonitor through
+                                # the GRASS percent channel.
+                                # https://github.com/YannChemin/MetaMonitor
+                                gs.percent(received, expected, 2)
+                                last_percent = percent
+                if expected and received != expected:
+                    raise OSError(
+                        f"{label}: got {received} bytes, expected {expected}"
+                    )
+                partial.replace(destination)
+                gs.percent(1, 1, 1)
+                gs.verbose(f"{label}: {received} bytes")
+                return destination
+        except Exception as exc:  # noqa: BLE001 - retried, then fatal
+            if attempt == attempts:
+                _fatal(f"{label}: download failed after {attempts} attempts: {exc}")
+            delay = 2**attempt
+            gs.warning(
+                f"{label}: attempt {attempt} of {attempts} failed ({exc}); "
+                f"retrying in {delay} s"
+            )
+            time.sleep(delay)
+    return destination
+
+
 def _vsicurl(path):
     text = str(path)
     if text.startswith(("http://", "https://")):
@@ -342,15 +470,16 @@ def _run_calibrator(
     subtract_noise,
     memory_mb,
     threads,
+    opencl=None,
 ):
     command = [
         binary,
         "--measurement",
         _vsicurl(source_path),
         "--calibration",
-        str(calibration_path),
+        _vsicurl(calibration_path),
         "--noise",
-        str(noise_path),
+        _vsicurl(noise_path),
         "--output",
         str(output_path),
         "--mask",
@@ -364,6 +493,14 @@ def _run_calibrator(
         "--threads",
         str(threads),
     ]
+    if opencl:
+        command.append("--opencl")
+        if opencl.get("device") is not None:
+            command += ["--opencl-device", str(opencl["device"])]
+        if opencl.get("profile") and opencl["profile"] != "auto":
+            command += ["--profile", opencl["profile"]]
+        if opencl.get("timing"):
+            command.append("--opencl-timing")
     gs.debug(" ".join(command))
     completed = subprocess.run(command, text=True, capture_output=True)
     if completed.returncode != 0:
@@ -371,6 +508,12 @@ def _run_calibrator(
             "s1calibrate failed:\n"
             + (completed.stderr or completed.stdout or "no diagnostic output")
         )
+    # The engine reports its device and profile on stderr. Surface it, because
+    # which device ran the arithmetic belongs in the run log.
+    for line in (completed.stderr or "").splitlines():
+        if line.startswith("s1calibrate: OpenCL"):
+            gs.verbose(line)
+    return completed.stderr or ""
 
 
 def _write_calibrated(
@@ -382,11 +525,20 @@ def _write_calibrated(
     lut_name,
     subtract_noise,
     memory_mb,
+    opencl=None,
+    engine="auto",
 ):
-    binary = _find_calibrator()
+    binary = None if engine == "python" else _find_calibrator()
+    if engine in ("c", "opencl") and binary is None:
+        # A forced engine that is not available is an error: falling back
+        # silently would make a run unreproducible and the timings a lie.
+        _fatal(
+            f"engine={engine} requested but the s1calibrate binary was not "
+            "found; build it with make -C src, or set S1CAL_BIN"
+        )
     if binary is not None:
         threads = max(1, min(int(os.cpu_count() or 1), 8))
-        _run_calibrator(
+        log = _run_calibrator(
             binary,
             source_path,
             calibration_path,
@@ -397,6 +549,7 @@ def _write_calibrated(
             subtract_noise,
             memory_mb,
             threads,
+            opencl,
         )
         with rasterio.open(output_path) as calibrated, rasterio.open(mask_path) as mask:
             gcps, gcp_crs = calibrated.gcps
@@ -407,8 +560,26 @@ def _write_calibrated(
             "width": width,
             "height": height,
             "block_size": _block_side(memory_mb, width, height),
-            "engine": "c-openmp",
+            "engine": "opencl" if opencl else "c-openmp",
             "threads": threads,
+            # The device line is kept verbatim, so a product can be traced to
+            # the device that produced it. The OpenCL kernel works in single
+            # precision and the C engine in double: they agree to about 6e-8
+            # relative over the signal range, and disagree only at the noise
+            # floor, where the DN-squared minus noise subtraction cancels and
+            # gamma0 is physically meaningless. See tests/test_engines.py.
+            "device": next(
+                (
+                    line.split("OpenCL ", 1)[1]
+                    for line in log.splitlines()
+                    if line.startswith("s1calibrate: OpenCL ")
+                    and "timing" not in line
+                ),
+                None,
+            )
+            if opencl
+            else None,
+            "precision": "float32" if opencl else "float64",
         }
 
     calibration = core.parse_calibration(calibration_path)
@@ -608,6 +779,20 @@ def _process_polarisation(
         lut_name,
         subtract_noise,
         int(options["memory"]),
+        opencl=(
+            {
+                "device": (
+                    int(options["opencl_device"])
+                    if options.get("opencl_device")
+                    else None
+                ),
+                "profile": options.get("profile") or "auto",
+                "timing": os.environ.get("S1CAL_OPENCL_PROFILE") is not None,
+            }
+            if options.get("engine") == "opencl"
+            else None
+        ),
+        engine=options.get("engine") or "auto",
     )
 
     _warp(
@@ -710,6 +895,11 @@ def main():
                 "item": item.id,
                 "stac": options["stac"],
             }
+            staging = (
+                Path(options["cache"]).expanduser() / item.id
+                if options["cache"]
+                else tempdir
+            )
             for polarisation in options["polarisations"]:
                 measurement = item.assets.get(polarisation)
                 calibration_asset = item.assets.get(f"schema-calibration-{polarisation}")
@@ -719,14 +909,34 @@ def main():
                     continue
                 if calibration_asset is None or noise_asset is None:
                     _fatal(f"item lacks calibration/noise XML for {polarisation}")
+                gs.message(f"Fetching {polarisation} assets")
+                local_measurement = _stage_asset(
+                    measurement.href,
+                    staging / f"{polarisation}.tiff",
+                    f"{polarisation} measurement",
+                )
+                local_calibration = _stage_asset(
+                    calibration_asset.href,
+                    staging / f"calibration-{polarisation}.xml",
+                    f"{polarisation} calibration",
+                )
+                local_noise = _stage_asset(
+                    noise_asset.href,
+                    staging / f"noise-{polarisation}.xml",
+                    f"{polarisation} noise",
+                )
                 source_record = dict(source_mode)
                 source_record["measurement_asset"] = polarisation
+                source_record["staged_locally"] = True
+                source_record["cache"] = (
+                    str(staging) if options["cache"] else None
+                )
                 records.append(
                     _process_polarisation(
                         polarisation,
-                        measurement.href,
-                        calibration_asset.href,
-                        noise_asset.href,
+                        str(local_measurement),
+                        str(local_calibration),
+                        str(local_noise),
                         acquisition,
                         source_record,
                         region,

@@ -28,10 +28,24 @@ if(S1CAL_BUILD_ENGINE)
       RUNTIME_OUTPUT_DIRECTORY ${OUTDIR}/${GRASSAddon_BinDIR})
     install(TARGETS s1calibrate RUNTIME DESTINATION ${GRASSAddon_BinDIR})
     message(STATUS "s1calibrate: C+OpenMP engine enabled")
+
+    # The OpenCL engine is optional. Without it the binary still builds and
+    # --opencl fails loudly, rather than falling back to the CPU in silence.
+    find_package(OpenCL QUIET)
+    if(OpenCL_FOUND)
+      target_compile_definitions(s1calibrate PRIVATE S1CAL_HAVE_OPENCL)
+      target_link_libraries(s1calibrate PRIVATE OpenCL::OpenCL)
+      # The kernel is read at run time, so it is installed beside the binary;
+      # s1calibrate looks there, then in ../etc and ../share, then at
+      # S1CAL_KERNEL.
+      configure_file(src/s1calibrate.cl
+        ${OUTDIR}/${GRASSAddon_BinDIR}/s1calibrate.cl COPYONLY)
+      install(FILES src/s1calibrate.cl DESTINATION ${GRASSAddon_BinDIR})
+      message(STATUS "s1calibrate: OpenCL engine enabled")
+    else()
+      message(STATUS "s1calibrate: OpenCL not found, CPU engine only")
+    endif()
   else()
     message(WARNING "s1calibrate not built: need GDAL, expat and OpenMP development files")
   endif()
-
-  # OpenCL is optional; the host integration is tracked in TODO.md. When it
-  # lands, link OpenCL::OpenCL here and gate the kernel behind --opencl.
 endif()
