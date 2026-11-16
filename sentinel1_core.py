@@ -186,10 +186,36 @@ def _parse_calibration_root(root: ET.Element) -> Calibration:
     return Calibration(lines=lines, pixels=pixels, sigma=sigma, beta=beta, gamma=gamma)
 
 
+#: Range-noise vector element, and its pre-IPF-2.90 name. Products acquired
+#: before March 2018 call the element "noiseVector" and its LUT "noiseLut",
+#: with the same children; they carry no azimuth vectors at all, which needs
+#: no special case because the azimuth factor defaults to 1.
+RANGE_VECTOR_TAGS = ("noiseRangeVector", "noiseVector")
+RANGE_LUT_TAGS = ("noiseRangeLut", "noiseLut")
+
+
+def _first_child_text(element: ET.Element, names: tuple[str, ...]) -> str:
+    """Text of the first child matching any of several element names.
+
+    :param names: Candidate local names, in order of preference.
+    :raises ValueError: If the element has none of them.
+    """
+    for name in names:
+        for child in element:
+            if _local(child.tag) == name:
+                return child.text or ""
+    raise ValueError(f"element has none of {', '.join(names)}")
+
+
 def _parse_noise_root(root: ET.Element) -> Noise:
-    range_vectors = [e for e in root.iter() if _local(e.tag) == "noiseRangeVector"]
+    range_vectors = [
+        e for e in root.iter() if _local(e.tag) in RANGE_VECTOR_TAGS
+    ]
     if not range_vectors:
-        raise ValueError("noise XML has no noiseRangeVector")
+        raise ValueError(
+            "noise XML has neither noiseRangeVector (IPF 2.90 and later) "
+            "nor noiseVector (earlier products)"
+        )
 
     rows: dict[int, tuple[np.ndarray, np.ndarray]] = {}
     reference_pixels: np.ndarray | None = None
@@ -197,11 +223,13 @@ def _parse_noise_root(root: ET.Element) -> Noise:
     for vector in range_vectors:
         line = _ints(_child_text(vector, "line"))
         if line.size != 1:
-            raise ValueError("noiseRangeVector must have exactly one line value")
+            raise ValueError(
+                "a noise range vector must have exactly one line value"
+            )
         pixels = _ints(_child_text(vector, "pixel"))
-        lut = _floats(_child_text(vector, "noiseRangeLut"))
+        lut = _floats(_first_child_text(vector, RANGE_LUT_TAGS))
         _, checked_pixels, checked_lut = _normalise_grid(
-            line, pixels, lut, name="noiseRangeLut", allow_zero=True
+            line, pixels, lut, name="noise range LUT", allow_zero=True
         )
         if reference_pixels is None:
             reference_pixels = checked_pixels

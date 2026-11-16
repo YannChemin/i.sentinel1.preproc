@@ -140,6 +140,28 @@ one, decaying monotonically as the exclusion radius widens.
       the 2014 beginning of the archive and the scene was reported as having no
       orbit. The offline test passed throughout because it asserted only the
       date in the key; it now asserts the whole key.
+- [x] **Pre-IPF-2.90 noise annotation.** ESA renamed the range-noise elements
+      with IPF 2.90 (March 2018): `noiseVector`/`noiseLut` became
+      `noiseRangeVector`/`noiseRangeLut`, and `noiseAzimuthVector` was added.
+      Both engines only knew the new names, so every product acquired before
+      March 2018 died with "noise XML has no noiseRangeVector" -- **62 of the
+      665 Sharjah scenes, 9 %, and all at the early end of the archive**, so it
+      shortened a baseline rather than thinning it evenly. Found by running
+      Stage 04: the first 8 scenes of the demonstrator subset all failed.
+      Fixed in `src/s1calibrate.c` (both SAX handlers and the LUT element) and
+      `sentinel1_core.py` (`RANGE_VECTOR_TAGS`/`RANGE_LUT_TAGS` and a new
+      `_first_child_text`). No azimuth special case was needed: `fill_azimuth`
+      already defaults the factor to 1, which is exactly right for the old
+      format. Six regression tests in `tests/test_noise_formats.py` carry real
+      element names and LUT values from a 2017 annotation, so the test fails if
+      the convention is mis-remembered and not only if the code regresses.
+      Suite now **42 passed**.
+
+      Note for the next build: `make` through the grass-addons symlink builds
+      only the script and the manual. The C engine has its own
+      `src/Makefile` and must be built there, then installed to
+      `~/.grass8/addons/bin/s1calibrate`. A rebuild that skips this step leaves
+      the old binary in place and the fix appears not to work.
 
 ## Next
 - [ ] Re-benchmark with 4-8 concurrent scene workers, which is the case where

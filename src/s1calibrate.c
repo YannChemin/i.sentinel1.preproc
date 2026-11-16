@@ -300,7 +300,7 @@ static void push_range_row(Parser *p)
         die("noiseRangeVector must have one line value");
     }
     if (p->pixel.n == 0 || p->lut.n != p->pixel.n) {
-        die("noiseRangeVector arrays have inconsistent lengths");
+        die("noise range vector arrays have inconsistent lengths");
     }
     if (p->range.n == p->range.cap) {
         p->range.cap = p->range.cap ? p->range.cap * 2 : 16;
@@ -448,7 +448,8 @@ static void build_cal(const CalRows *rows, Cal *out)
 static void build_noise(const RangeRows *rows, const AzRows *az, Noise *out)
 {
     if (rows->n == 0) {
-        die("noise XML has no noiseRangeVector");
+        die("noise XML has neither noiseRangeVector (IPF 2.90 and later) "
+            "nor noiseVector (earlier products)");
     }
     const IntVec *reference = &rows->v[0].pixel;
     out->nlines = (int)rows->n;
@@ -464,7 +465,7 @@ static void build_noise(const RangeRows *rows, const AzRows *az, Noise *out)
     for (int r = 0; r < out->nlines; r++) {
         const RangeRow *row = &rows->v[r];
         if (row->line.n != 1 || row->lut.n != row->pixel.n) {
-            die("noiseRangeVector arrays have inconsistent lengths");
+            die("noise range vector arrays have inconsistent lengths");
         }
         out->lines[r] = (double)row->line.v[0];
         for (int j = 0; j < out->npix; j++) {
@@ -500,7 +501,12 @@ static void XMLCALL start_element(void *userData, const XML_Char *name, const XM
     if (strcmp(name, "calibrationVector") == 0) {
         p->vec = VEC_CAL;
         reset_vector(p);
-    } else if (strcmp(name, "noiseRangeVector") == 0) {
+    } else if (strcmp(name, "noiseRangeVector") == 0 ||
+               strcmp(name, "noiseVector") == 0) {
+        /* "noiseVector" is the pre-IPF-2.90 name, used by products acquired
+         * before March 2018. The element has the same children, so the same
+         * handler reads both; the old format simply has no azimuth vectors,
+         * and fill_azimuth() already defaults the azimuth factor to 1. */
         p->vec = VEC_RANGE;
         reset_vector(p);
     } else if (strcmp(name, "noiseAzimuthVector") == 0) {
@@ -517,7 +523,8 @@ static void XMLCALL end_element(void *userData, const XML_Char *name)
         p->vec = VEC_NONE;
         return;
     }
-    if (strcmp(name, "noiseRangeVector") == 0) {
+    if (strcmp(name, "noiseRangeVector") == 0 ||
+        strcmp(name, "noiseVector") == 0) {
         push_range_row(p);
         p->vec = VEC_NONE;
         return;
@@ -537,7 +544,9 @@ static void XMLCALL end_element(void *userData, const XML_Char *name)
         parse_doubles(&p->text, &p->beta);
     } else if (strcmp(name, "gamma") == 0) {
         parse_doubles(&p->text, &p->gamma);
-    } else if (strcmp(name, "noiseRangeLut") == 0) {
+    } else if (strcmp(name, "noiseRangeLut") == 0 ||
+               strcmp(name, "noiseLut") == 0) {
+        /* "noiseLut" is the pre-IPF-2.90 name; see start_element(). */
         parse_doubles(&p->text, &p->lut);
     } else if (strcmp(name, "noiseAzimuthLut") == 0) {
         parse_doubles(&p->text, &p->lut);
