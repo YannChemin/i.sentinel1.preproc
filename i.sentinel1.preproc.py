@@ -159,6 +159,28 @@
 # %end
 
 # %option
+# % key: orbit
+# % type: string
+# % required: no
+# % multiple: no
+# % options: none,auto,precise,restituted
+# % answer: none
+# % label: Fetch the ESA orbit state vectors for the scene
+# % description: auto takes the precise product when it exists, else restituted
+# % guisection: Geometry
+# %end
+
+# %option
+# % key: orbit_dir
+# % type: string
+# % required: no
+# % multiple: no
+# % label: Directory for the downloaded orbit files
+# % description: Default: a temporary directory removed at the end of the run
+# % guisection: Geometry
+# %end
+
+# %option
 # % key: cache
 # % type: string
 # % required: no
@@ -196,7 +218,7 @@ import sys
 import tempfile
 import time
 import warnings
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 import numpy as np
@@ -210,11 +232,13 @@ import grass.script as gs
 try:
     # Running from the source directory, which Python puts on sys.path itself.
     import sentinel1_core as core
+    import sentinel1_orbit as orbitlib
 except ImportError:
-    # Installed: the module lives in $GISBASE/etc/i.sentinel1.preproc/ or in the
-    # same directory under GRASS_ADDON_BASE, which set_path() locates.
+    # Installed: the modules live in $GISBASE/etc/i.sentinel1.preproc/ or in
+    # the same directory under GRASS_ADDON_BASE, which set_path() locates.
     gs.utils.set_path(modulename="i.sentinel1.preproc")
     import sentinel1_core as core
+    import sentinel1_orbit as orbitlib
 
 MODULE = "i.sentinel1.preproc"
 VERSION = "0.1.0"
@@ -349,10 +373,14 @@ def _source_window(measurement_path, region, pad=WINDOW_PAD):
     """Source line and pixel window covering the current computational region.
 
     An IW GRD band is about 250 km square; a city-scale region is a few tens of
-    kilometres across, so roughly 4 % of the band carries the product and the
-    rest is read, calibrated and thrown away by the warp. Over a 1 MiB/s link
-    that difference is the whole feasibility of a multi-year archive: 665
-    scenes is 612 GiB whole-band against 26 GiB windowed.
+    kilometres across, so most of the band would be read, calibrated and thrown
+    away by the warp. Over a 1 MiB/s link that difference decides whether a
+    multi-year archive is feasible at all. Measured on the Sharjah area of
+    interest, 46 by 57 km: the window is 12 % of the band, a scene takes
+    2 m 25 s instead of 11 m 35 s, and 665 scenes come to about 21 h of
+    download instead of 174 h. The share exceeds the area ratio because a
+    projected region is rotated with respect to the swath, so its bounding box
+    in source line and pixel coordinates is wider than its area.
 
     The scene has no geotransform, only a grid of ground control points, so the
     window is found by fitting a second-order polynomial from longitude and
@@ -541,6 +569,79 @@ def _stage_asset(href, destination, label):
             )
             time.sleep(delay)
     return destination
+
+
+def _mission_of(item):
+    """Work out the Sentinel-1 unit that took a scene.
+
+    :param item: The STAC item.
+    :returns: ``S1A`` ... ``S1D``.
+    """
+    platform = (item.properties.get("platform") or "").upper()
+    # "SENTINEL-1A" in the Planetary Computer properties; the item id starts
+    # with "S1A" and is the fallback.
+    if platform.startswith("SENTINEL-1") and len(platform) > 10:
+        return "S1" + platform[10]
+    if item.id[:3].upper().startswith("S1"):
+        return item.id[:3].upper()
+    _fatal(f"cannot tell which Sentinel-1 unit took {item.id}")
+    return None
+
+
+def _fetch_orbit(item, acquisition, kind, orbit_dir, tempdir):
+    """Fetch and parse the orbit state vectors for a scene.
+
+    The vectors are not used by the calibration, which works against the
+    ellipsoid. They are fetched, validated and recorded so that terrain
+    correction can be built on them: the Planetary Computer GRD item carries
+    no state vectors at all, which is what blocks a local incidence angle and
+    a layover or shadow mask.
+
+    A failure here is a warning, not a fatal error: the calibration this module
+    performs does not depend on the orbit, so a scene still produces its
+    product and says in the provenance that no orbit was attached.
+
+    :param kind: ``auto``, ``precise`` or ``restituted``.
+    :param orbit_dir: Directory to keep the files in, or ``None`` for tempdir.
+    :returns: A provenance dict, or ``None`` if nothing could be fetched.
+    """
+    if acquisition is None:
+        gs.warning("the item has no acquisition time; no orbit fetched")
+        return None
+    if acquisition.tzinfo is None:
+        acquisition = acquisition.replace(tzinfo=timezone.utc)
+    mission = _mission_of(item)
+    target = Path(orbit_dir).expanduser() if orbit_dir else tempdir / "orbit"
+    gs.message(f"Fetching {kind} orbit for {mission}")
+    try:
+        path, info = orbitlib.fetch_orbit(
+            mission,
+            acquisition,
+            target,
+            kind=kind,
+            # https://github.com/YannChemin/MetaMonitor
+            progress=lambda done, total: gs.percent(done, total, 5),
+        )
+        vectors = orbitlib.parse_state_vectors(path)
+    except orbitlib.OrbitError as exc:
+        gs.warning(f"no orbit state vectors attached: {exc}")
+        return None
+    gs.verbose(
+        f"orbit {info['name']}: {len(vectors['epochs'])} state vectors"
+    )
+    return {
+        "file": info["name"],
+        "product": info["product"],
+        "validity_start": info["start"].isoformat(),
+        "validity_stop": info["stop"].isoformat(),
+        "generated": info["generated"].isoformat(),
+        "state_vectors": len(vectors["epochs"]),
+        "absolute_orbit": vectors["absolute_orbit"][0],
+        "source": orbitlib.BUCKET_URL,
+        "path": str(path) if orbit_dir else None,
+        # Said plainly, so a product is never read as terrain corrected.
+        "used_for": "recorded only; calibration is against the ellipsoid",
+    }
 
 
 def _vsicurl(path):
@@ -1077,6 +1178,17 @@ def main():
                 "item": item.id,
                 "stac": options["stac"],
             }
+            orbit_record = None
+            if options["orbit"] != "none":
+                orbit_record = _fetch_orbit(
+                    item,
+                    acquisition,
+                    options["orbit"],
+                    options["orbit_dir"],
+                    tempdir,
+                )
+                source_mode["orbit"] = orbit_record
+
             staging = (
                 Path(options["cache"]).expanduser() / item.id
                 if options["cache"]
@@ -1149,6 +1261,15 @@ def main():
             root = Path(options["input_dir"]).expanduser()
             if not root.is_dir():
                 _fatal(f"input_dir does not exist: {root}")
+            if options["orbit"] != "none":
+                # Not silently ignored: the option was asked for and is not
+                # being honoured. A local SAFE product carries the product
+                # annotation, which has its own state vectors, so fetching
+                # from ESA is the wrong source here anyway.
+                gs.warning(
+                    "orbit= applies to item= mode; a local SAFE product has "
+                    "state vectors in its own product annotation"
+                )
             source_mode = {"mode": "input_dir", "path": str(root.resolve())}
             for polarisation in options["polarisations"]:
                 source = _safe_source(root, polarisation)

@@ -33,8 +33,11 @@ dimensionless multiplier close to one, applied inside its swath window.
 
 In item mode only the part of the swath the current region needs is read. An
 IW GRD band is about 250 km square, while a city-scale region is a few tens of
-kilometres across, so roughly 4 % of the band carries the product and the rest
-would be read, calibrated and discarded by the warp. The scene has no
+kilometres across, so most of the band would otherwise be read, calibrated and
+discarded by the warp. On a 46 by 57 km area of interest the window came to
+12 % of the band and the stage ran 4.8 times faster; the share is larger than
+the area ratio suggests, because a region is rotated with respect to the swath
+and its bounding box in source coordinates is wider than its area. The scene has no
 geotransform, only a grid of ground control points, so the window is found by
 fitting a second-order polynomial from longitude and latitude to source pixel
 and line over those points and evaluating it along the region's boundary, with
@@ -99,6 +102,42 @@ cancels, so a last-bit difference in the noise term becomes a large relative
 difference in a very small result. On a 144 million pixel scene one mask pixel
 differed. The provenance JSON records `engine`, `device` and `precision`, so a
 product can be traced to the engine that produced it.
+
+## ORBIT STATE VECTORS
+
+A Planetary Computer `sentinel-1-grd` item carries ground control points but no
+orbit state vectors: its `schema-product-*` asset is the RFI annotation, not the
+product annotation. **orbit=** fetches the official ESA auxiliary orbit file for
+the scene from the public `s1-orbits` bucket, over anonymous HTTPS with no
+account or token.
+
+`precise`
+: `AUX_POEORB`, centimetre accuracy, published about 20 days after acquisition.
+
+`restituted`
+: `AUX_RESORB`, decimetre accuracy, published within hours.
+
+`auto`
+: the precise product when the acquisition is old enough for one to exist, and
+  the restituted product otherwise.
+
+`none`
+: the default; no orbit is fetched.
+
+**orbit_dir=** keeps the files, which are about 4.5 MB each; a file already
+present is reused. The file name, product type, validity window, state-vector
+count and absolute orbit number go into the provenance JSON.
+
+The vectors are **recorded, not used**. This module calibrates against the
+ellipsoid, and the provenance says so. They are fetched so that terrain
+correction can be built on them: a local incidence angle, and a layover and
+shadow mask, all need the radar look vector, which needs the state vectors. A
+fetch that fails is a warning rather than an error, because no output of this
+module depends on it.
+
+**orbit=** applies to **item=** mode. A local SAFE product carries its own
+product annotation, with state vectors in it, so ESA's auxiliary file is the
+wrong source there.
 
 ## EXAMPLES
 

@@ -78,17 +78,68 @@ Updated 2026-11-14.
 
 Measured on this link, 2026-11-16: **1.0 MiB/s aggregate**, identical at 1, 4
 and 8 concurrent connections, so it is the link, not a per-connection cap, and
-parallel scene workers buy nothing on the download. One VV band is 0.46 GiB.
+parallel scene workers buy nothing on the download. One VV band is 0.46 GiB
+compressed.
 
-| Route | Data for 665 scenes x 2 pol | Time at 1.0 MiB/s |
-|---|---|---|
-| Whole band over `/vsicurl/` | 612 GiB | 174 h (7.3 days) |
-| Windowed to the Sharjah AOI (4.2 %) | 26 GiB | 7.3 h |
+Measured on the Sharjah AOI (45.9 x 57.4 km, EPSG:32640, 10 m) against the
+scene `S1A_IW_GRDH_1SDV_20240415T021552_..._053438_067B9A`, whose band is
+25724 x 15608:
+
+| Route | Window | Per scene, VV+VH | 665 scenes |
+|---|---|---|---|
+| Whole band | --- | 11 m 35 s | 174 h |
+| Windowed | 7561 x 6452 at (6131, 412) = **12.2 %** | **2 m 25 s** | **~21 h** |
+
+The window is 12.2 % of the band, not the 4.2 % the area ratio suggests,
+because the AOI is rotated with respect to the swath, so its bounding box in
+source line and pixel space is much larger than its area, and 512 px of margin
+is added on each side.
 
 The first attempt at a whole-band read failed after 48 minutes: the signed URL
 expired mid-read and Azure answered the remaining ranges with partial bodies
 (`TIFFReadEncodedTile() failed`). A window is both small enough to finish
-inside the token's life and 24 times less data.
+inside the token's life and eight times less data.
+
+### Window validation on a real scene
+
+A windowed run and a whole-band run of the **same code** over the same scene
+and region, so the window is the only variable:
+
+| | VV | VH |
+|---|---|---|
+| Mask value counts | identical (0: 74,696, 1: 25,701,142) | identical (0: 3,479,998, 1: 22,295,840) |
+| Mask disagreements | 0 | 0 |
+| Max abs dB difference | 5.2e-7 | 3.1e-5 |
+| Pixels differing at all | 825 of 25,775,838 (0.003 %) | 2,207 (0.009 %) |
+| Pixels differing > 0.01 dB | 0 | 0 |
+
+The residual is `gdalwarp` arithmetic: the window moves the source grid origin,
+so the resampling weights come out of slightly different floating-point
+coordinates. It is physically irrelevant at 1e-5 dB.
+
+The earlier comparison against the pre-fix product showed differences up to
+-6 dB, always negative. That was the nodata fix, not the window: bilinear
+resampling now includes noise-floor pixels the old run skipped as nodata, which
+pulls neighbours down. Confirmed by the gradient -- mean -0.139 dB (VV) and
+-0.453 dB (VH) next to a mask-0 pixel against -0.0002 and -0.001 dB away from
+one, decaying monotonically as the exclusion radius widens.
+- [x] **Orbit state vectors: source found and implemented.** ESA's auxiliary
+      orbit files are served by the public `s1-orbits` bucket over anonymous
+      HTTPS, no account or token. Copernicus Data Space OData searches openly
+      but returns 401 on download; `qc.sentinel1.eo.esa.int` does not resolve
+      from this machine. New `sentinel1_orbit.py` (shipped via ETCFILES) plus
+      `orbit=none|auto|precise|restituted` and `orbit_dir=`. Verified on the
+      test scene: 9,361 state vectors at 10 s spacing, radius 7,073 km and
+      speed 7,597 m/s at the acquisition instant. 19 tests, 18 offline with
+      the network replaced and 1 marked `network` that checks the bucket is
+      still anonymous (`pytest.ini` deselects it by default).
+      The vectors are **recorded, not used**: calibration is still against the
+      ellipsoid and the provenance says so. One bug worth remembering, caught
+      only by running it against the live bucket: the listing key was built as
+      `AUX_AUX_POEORB`, which sorts before every real key, so S3 restarted at
+      the 2014 beginning of the archive and the scene was reported as having no
+      orbit. The offline test passed throughout because it asserted only the
+      date in the key; it now asserts the whole key.
 
 ## Next
 - [ ] Re-benchmark with 4-8 concurrent scene workers, which is the case where
@@ -97,6 +148,13 @@ inside the token's life and 24 times less data.
       the GNU Make path through grass-addons is validated.
 - [ ] Install into `/usr/local/grass86` (needs root; the user's password was
       not available in the session that built it).
+- [ ] Terrain correction on top of the state vectors, in four steps: interpolate
+      the vectors to each azimuth line (10 s spacing at 7.6 km/s needs better
+      than linear); zero-Doppler range-azimuth solution per DEM cell for the
+      local incidence angle; layover and shadow (`r.horizon` gives the horizon
+      angles); radiometric normalisation by the local illuminated area. Only
+      the last changes pixel values, and it should not be claimed until it is
+      validated against the `sentinel-1-rtc` collection.
 - [ ] Try `cl_khr_fp64` for the noise subtraction on devices that have it, to
       see whether the noise-floor cancellation narrows; measure before keeping.
 - [ ] Overlapped transfers (two queues, double-buffered blocks) for a `dgpu`
