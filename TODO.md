@@ -48,13 +48,33 @@ Updated 2026-11-14.
       with ENOENT; only the measurement band had been routed through VSI. The
       reader also refuses a body under 1 KiB, so an error page or a redirect is
       reported instead of being handed to expat.
-- [x] Measurement band and annotations staged to a local file before
-      calibration, with four attempts and backoff, a `.part` file renamed on
-      completion, a size check and `gs.percent()` progress. New `cache=`
-      option reuses an asset already present at the expected size. Reading the
-      band over `/vsicurl/` took 48 min on the Sharjah AOI and then failed:
-      the signed URL expired mid-read and Azure returned partial bodies
-      (`TIFFReadEncodedTile() failed`).
+- [x] Measurement band read **windowed**: only the part of the swath the
+      current region needs.
+      The window comes from a second-order inverse fit of the scene's GCPs,
+      checked against its own residual, with 512 px of margin and a fall back
+      to the whole band on a bad fit. LUTs are applied at absolute source
+      coordinates, so a windowed product is bit-identical to the same
+      rectangle of a whole-band one (`tests/test_engines.py`, 2 new tests, one
+      of which also checks the GCP shift). `--window X,Y,W,H` on the binary,
+      automatic in the module, recorded in the provenance JSON.
+- [x] `cache=` option: download whole bands to a directory instead, reusing a
+      file already present at the expected size (HEAD, not GET).
+
+### Why the window matters more than any engine choice
+
+Measured on this link, 2026-11-16: **1.0 MiB/s aggregate**, identical at 1, 4
+and 8 concurrent connections, so it is the link, not a per-connection cap, and
+parallel scene workers buy nothing on the download. One VV band is 0.46 GiB.
+
+| Route | Data for 665 scenes x 2 pol | Time at 1.0 MiB/s |
+|---|---|---|
+| Whole band over `/vsicurl/` | 612 GiB | 174 h (7.3 days) |
+| Windowed to the Sharjah AOI (4.2 %) | 26 GiB | 7.3 h |
+
+The first attempt at a whole-band read failed after 48 minutes: the signed URL
+expired mid-read and Azure answered the remaining ranges with partial bodies
+(`TIFFReadEncodedTile() failed`). A window is both small enough to finish
+inside the token's life and 24 times less data.
 
 ## Next
 - [ ] Re-benchmark with 4-8 concurrent scene workers, which is the case where

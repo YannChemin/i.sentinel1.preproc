@@ -428,3 +428,74 @@ def test_profile_requires_opencl(scene):
     )
     assert result.returncode != 0
     assert "--profile applies to the OpenCL engine" in result.stderr
+
+
+def test_window_matches_the_same_region_of_the_whole_band(scene):
+    """A windowed run must equal the same rectangle of a whole-band run.
+
+    This is the test that makes the window trustworthy. The calibration and
+    noise LUTs are indexed by absolute source line and pixel, so a window that
+    forgot to add its offset would still produce a plausible-looking raster,
+    with the wrong LUT values applied to every pixel. Comparing against the
+    identical rectangle of a full run catches exactly that, and catches a
+    one-pixel offset too, because the LUTs vary across the swath.
+
+    An origin that is not a multiple of the block side is used on purpose, so
+    the window's blocks do not line up with the full run's blocks.
+    """
+    from osgeo import gdal as gdal_mod
+
+    binary = _binary()
+    full_linear, full_valid, _ = _run(binary, scene, "window_full")
+
+    x0, y0, w, h = 137, 71, 203, 189
+    win_linear, win_valid, log = _run(
+        binary, scene, "window_part", extra=("--window", f"{x0},{y0},{w},{h}")
+    )
+
+    assert win_linear.shape == (h, w), f"window raster is {win_linear.shape}"
+    assert "% of the band)" in log, f"window was not reported:\n{log}"
+
+    expected = full_linear[y0 : y0 + h, x0 : x0 + w]
+    expected_valid = full_valid[y0 : y0 + h, x0 : x0 + w]
+    _report_difference("window vs full band", win_linear, expected)
+    # Identical arithmetic on identical inputs, so this one is exact.
+    assert np.array_equal(win_linear, expected), "windowed values differ"
+    assert np.array_equal(win_valid, expected_valid), "windowed mask differs"
+
+    # The GCPs must move with the window, or the warp would place the subset
+    # where the full scene used to be.
+    full_gcps = gdal_mod.Open(str(scene["dir"] / "window_full.tif")).GetGCPs()
+    win_gcps = gdal_mod.Open(str(scene["dir"] / "window_part.tif")).GetGCPs()
+    assert len(full_gcps) == len(win_gcps)
+    for before, after in zip(full_gcps, win_gcps):
+        assert after.GCPPixel == pytest.approx(before.GCPPixel - x0)
+        assert after.GCPLine == pytest.approx(before.GCPLine - y0)
+        assert after.GCPX == pytest.approx(before.GCPX)
+        assert after.GCPY == pytest.approx(before.GCPY)
+
+
+def test_window_is_rejected_when_it_misses_the_band(scene):
+    """A window outside the raster is an error, not a silent empty product."""
+    binary = _binary()
+    command = [
+        str(_binary()),
+        "--measurement",
+        str(scene["measurement"]),
+        "--calibration",
+        str(scene["calibration"]),
+        "--noise",
+        str(scene["noise"]),
+        "--output",
+        str(scene["dir"] / "window_miss.tif"),
+        "--mask",
+        str(scene["dir"] / "window_miss_mask.tif"),
+        "--lut",
+        "gamma",
+        "--window",
+        f"{SIDE + 10},0,64,64",
+    ]
+    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    assert result.returncode != 0, "a window past the edge of the band was accepted"
+    assert "outside the measurement raster" in result.stderr, result.stderr
+    assert binary is not None

@@ -329,6 +329,113 @@ def _safe_source(root, polarisation):
     return measurement, calibration, noise, _source_time_from_manifest(root / "manifest.safe")
 
 
+#: Pixels of margin added around the computed source window. The inverse fit
+#: is good to a few pixels on this grid, the warp needs neighbours for bilinear
+#: resampling, and a GRD band is cheap at this scale, so the margin is generous.
+WINDOW_PAD = 512
+
+#: A second-order inverse fit whose own residual exceeds this many source
+#: pixels is not trusted, and the whole band is read instead.
+WINDOW_MAX_RESIDUAL_PX = 64.0
+
+
+def _source_window(measurement_path, region, pad=WINDOW_PAD):
+    """Source line and pixel window covering the current computational region.
+
+    An IW GRD band is about 250 km square; a city-scale region is a few tens of
+    kilometres across, so roughly 4 % of the band carries the product and the
+    rest is read, calibrated and thrown away by the warp. Over a 1 MiB/s link
+    that difference is the whole feasibility of a multi-year archive: 665
+    scenes is 612 GiB whole-band against 26 GiB windowed.
+
+    The scene has no geotransform, only a grid of ground control points, so the
+    window is found by fitting a second-order polynomial from longitude and
+    latitude to source pixel and line over those points and evaluating it at
+    the region's boundary. The fit's own residual on the control points is
+    checked: a scene whose geometry this cannot describe falls back to the whole
+    band with a warning, rather than silently returning a window in the wrong
+    place.
+
+    :param measurement_path: The measurement band, local or ``/vsicurl/``.
+    :param region: The current region, as :func:`_region` returns it.
+    :returns: ``(x, y, width, height)``, or ``None`` for the whole band.
+    """
+    from rasterio.warp import transform as warp_transform
+
+    with rasterio.open(measurement_path) as src:
+        gcps, gcp_crs = src.gcps
+        src_width, src_height = src.width, src.height
+    if len(gcps) < 10:
+        gs.warning("too few GCPs to fit a source window; reading the whole band")
+        return None
+
+    lon = np.array([g.x for g in gcps], dtype=float)
+    lat = np.array([g.y for g in gcps], dtype=float)
+    col = np.array([g.col for g in gcps], dtype=float)
+    row = np.array([g.row for g in gcps], dtype=float)
+
+    # Centred and scaled, so the normal equations stay well conditioned.
+    lon0, lat0 = lon.mean(), lat.mean()
+    lon_s = max(float(np.ptp(lon)), 1e-6)
+    lat_s = max(float(np.ptp(lat)), 1e-6)
+
+    def design(a, b):
+        u = (a - lon0) / lon_s
+        v = (b - lat0) / lat_s
+        return np.column_stack(
+            [np.ones_like(u), u, v, u * u, u * v, v * v]
+        )
+
+    matrix = design(lon, lat)
+    col_fit, *_ = np.linalg.lstsq(matrix, col, rcond=None)
+    row_fit, *_ = np.linalg.lstsq(matrix, row, rcond=None)
+    residual = max(
+        np.abs(matrix @ col_fit - col).max(), np.abs(matrix @ row_fit - row).max()
+    )
+    if residual > WINDOW_MAX_RESIDUAL_PX:
+        gs.warning(
+            f"inverse GCP fit residual is {residual:.0f} px, above the "
+            f"{WINDOW_MAX_RESIDUAL_PX:.0f} px limit; reading the whole band"
+        )
+        return None
+    gs.verbose(f"inverse GCP fit residual: {residual:.1f} source pixels")
+
+    # The region boundary is sampled, not just cornered: in the scene's own
+    # geometry a projected rectangle is a curved quadrilateral, so its extreme
+    # line and pixel can fall on an edge rather than at a corner.
+    steps = np.linspace(0.0, 1.0, 21)
+    xs = region["w"] + (region["e"] - region["w"]) * steps
+    ys = region["s"] + (region["n"] - region["s"]) * steps
+    edge_x = np.concatenate([xs, xs, np.full_like(ys, region["w"]),
+                             np.full_like(ys, region["e"])])
+    edge_y = np.concatenate([np.full_like(xs, region["s"]),
+                             np.full_like(xs, region["n"]), ys, ys])
+    region_crs = CRS.from_wkt(_region_wkt())
+    lon_edge, lat_edge = warp_transform(
+        region_crs, gcp_crs, edge_x.tolist(), edge_y.tolist()
+    )
+    probe = design(np.asarray(lon_edge), np.asarray(lat_edge))
+    cols = probe @ col_fit
+    rows = probe @ row_fit
+
+    x0 = int(np.floor(cols.min())) - pad
+    y0 = int(np.floor(rows.min())) - pad
+    x1 = int(np.ceil(cols.max())) + pad
+    y1 = int(np.ceil(rows.max())) + pad
+    x0 = max(0, min(x0, src_width - 1))
+    y0 = max(0, min(y0, src_height - 1))
+    x1 = max(x0 + 1, min(x1, src_width))
+    y1 = max(y0 + 1, min(y1, src_height))
+    if (x1 - x0) >= src_width and (y1 - y0) >= src_height:
+        return None
+    share = 100.0 * (x1 - x0) * (y1 - y0) / (src_width * src_height)
+    gs.verbose(
+        f"source window {x1 - x0}+{x0} x {y1 - y0}+{y0} "
+        f"of {src_width} x {src_height} ({share:.1f} % of the band)"
+    )
+    return x0, y0, x1 - x0, y1 - y0
+
+
 def _stage_asset(href, destination, label):
     """Download one remote asset to a local file, with retries.
 
@@ -471,6 +578,7 @@ def _run_calibrator(
     memory_mb,
     threads,
     opencl=None,
+    window=None,
 ):
     command = [
         binary,
@@ -493,6 +601,8 @@ def _run_calibrator(
         "--threads",
         str(threads),
     ]
+    if window:
+        command += ["--window", ",".join(str(int(v)) for v in window)]
     if opencl:
         command.append("--opencl")
         if opencl.get("device") is not None:
@@ -527,6 +637,7 @@ def _write_calibrated(
     memory_mb,
     opencl=None,
     engine="auto",
+    window=None,
 ):
     binary = None if engine == "python" else _find_calibrator()
     if engine in ("c", "opencl") and binary is None:
@@ -550,6 +661,7 @@ def _write_calibrated(
             memory_mb,
             threads,
             opencl,
+            window,
         )
         with rasterio.open(output_path) as calibrated, rasterio.open(mask_path) as mask:
             gcps, gcp_crs = calibrated.gcps
@@ -580,6 +692,7 @@ def _write_calibrated(
             if opencl
             else None,
             "precision": "float32" if opencl else "float64",
+            "source_window": list(window) if window else None,
         }
 
     calibration = core.parse_calibration(calibration_path)
@@ -598,22 +711,43 @@ def _write_calibrated(
         core.validate_gcp_count(len(gcps))
         if gcp_crs is None:
             gcp_crs = CRS.from_epsg(4326)
-        width, height = source.width, source.height
+        # The same window as the compiled engines, so the three stay comparable.
+        # The LUTs are indexed by absolute source line and pixel, so the window
+        # only shifts the coordinates handed to the block; the GCPs shift with
+        # it, because they are expressed in source pixel coordinates.
+        off_x, off_y = (int(window[0]), int(window[1])) if window else (0, 0)
+        width = int(window[2]) if window else source.width
+        height = int(window[3]) if window else source.height
+        shifted = [
+            type(g)(
+                row=g.row - off_y,
+                col=g.col - off_x,
+                x=g.x,
+                y=g.y,
+                z=g.z,
+                id=g.id,
+                info=g.info,
+            )
+            for g in gcps
+        ]
         side = _block_side(memory_mb, width, height)
         calibrated = _gcp_dataset(
-            output_path, width, height, "float32", 0, gcps, gcp_crs
+            output_path, width, height, "float32", 0, shifted, gcp_crs
         )
-        mask = _gcp_dataset(mask_path, width, height, "uint8", 0, gcps, gcp_crs)
+        mask = _gcp_dataset(mask_path, width, height, "uint8", 0, shifted, gcp_crs)
         try:
             for row in range(0, height, side):
                 rows = min(side, height - row)
                 for column in range(0, width, side):
                     columns = min(side, width - column)
-                    window = Window(column, row, columns, rows)
-                    dn = source.read(1, window=window)
-                    line_coords = np.arange(row, row + rows, dtype=np.float64)[:, None]
+                    source_window = Window(off_x + column, off_y + row, columns, rows)
+                    target_window = Window(column, row, columns, rows)
+                    dn = source.read(1, window=source_window)
+                    line_coords = np.arange(
+                        off_y + row, off_y + row + rows, dtype=np.float64
+                    )[:, None]
                     pixel_coords = np.arange(
-                        column, column + columns, dtype=np.float64
+                        off_x + column, off_x + column + columns, dtype=np.float64
                     )[None, :]
                     linear, valid = core.calibrate_block(
                         dn,
@@ -624,8 +758,8 @@ def _write_calibrated(
                         lut_name=lut_name,
                         subtract_noise=subtract_noise,
                     )
-                    calibrated.write(linear, 1, window=window)
-                    mask.write(valid, 1, window=window)
+                    calibrated.write(linear, 1, window=target_window)
+                    mask.write(valid, 1, window=target_window)
         finally:
             calibrated.close()
             mask.close()
@@ -635,6 +769,7 @@ def _write_calibrated(
         "height": height,
         "block_size": side,
         "engine": "python",
+        "source_window": list(window) if window else None,
     }
 
 
@@ -769,6 +904,10 @@ def _process_polarisation(
     warped_path = tempdir / f"{polarisation}_calibrated_warped.tif"
     warped_mask = tempdir / f"{polarisation}_mask_warped.tif"
 
+    # The window is computed from the scene's own GCPs against the current
+    # region, so only the part of the swath the region needs is read.
+    window = _source_window(_vsicurl(measurement), region)
+
     gs.message(f"Calibrating {polarisation} with {options['calibration']}")
     geometry = _write_calibrated(
         measurement,
@@ -793,6 +932,7 @@ def _process_polarisation(
             else None
         ),
         engine=options.get("engine") or "auto",
+        window=window,
     )
 
     _warp(
@@ -909,34 +1049,52 @@ def main():
                     continue
                 if calibration_asset is None or noise_asset is None:
                     _fatal(f"item lacks calibration/noise XML for {polarisation}")
-                gs.message(f"Fetching {polarisation} assets")
-                local_measurement = _stage_asset(
-                    measurement.href,
-                    staging / f"{polarisation}.tiff",
-                    f"{polarisation} measurement",
-                )
-                local_calibration = _stage_asset(
-                    calibration_asset.href,
-                    staging / f"calibration-{polarisation}.xml",
-                    f"{polarisation} calibration",
-                )
-                local_noise = _stage_asset(
-                    noise_asset.href,
-                    staging / f"noise-{polarisation}.xml",
-                    f"{polarisation} noise",
-                )
+                # Without cache= the band is read over /vsicurl/, restricted
+                # to the window the region needs: a few per cent of the swath,
+                # which finishes well inside the signed URL's lifetime. With
+                # cache= the whole band is fetched to disk instead, which is
+                # what repeated runs over one scene, or an unreliable link,
+                # want. The annotations are read through GDAL's virtual file
+                # layer either way; they are about a megabyte each.
+                if options["cache"]:
+                    gs.message(f"Fetching {polarisation} assets")
+                    source_measurement = str(
+                        _stage_asset(
+                            measurement.href,
+                            staging / f"{polarisation}.tiff",
+                            f"{polarisation} measurement",
+                        )
+                    )
+                    source_calibration = str(
+                        _stage_asset(
+                            calibration_asset.href,
+                            staging / f"calibration-{polarisation}.xml",
+                            f"{polarisation} calibration",
+                        )
+                    )
+                    source_noise = str(
+                        _stage_asset(
+                            noise_asset.href,
+                            staging / f"noise-{polarisation}.xml",
+                            f"{polarisation} noise",
+                        )
+                    )
+                else:
+                    source_measurement = measurement.href
+                    source_calibration = calibration_asset.href
+                    source_noise = noise_asset.href
                 source_record = dict(source_mode)
                 source_record["measurement_asset"] = polarisation
-                source_record["staged_locally"] = True
+                source_record["staged_locally"] = bool(options["cache"])
                 source_record["cache"] = (
                     str(staging) if options["cache"] else None
                 )
                 records.append(
                     _process_polarisation(
                         polarisation,
-                        str(local_measurement),
-                        str(local_calibration),
-                        str(local_noise),
+                        source_measurement,
+                        source_calibration,
+                        source_noise,
                         acquisition,
                         source_record,
                         region,

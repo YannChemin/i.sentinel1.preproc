@@ -26,17 +26,25 @@ motivated the module.
 subtracts it directly from the squared digital number. The azimuth LUT is a
 dimensionless multiplier close to one, applied inside its swath window.
 
-In item mode the measurement band and the two annotation files are downloaded
-to a local directory before calibration, not read over `/vsicurl/`. A GRD band
-is about 1 GB of tiled GeoTIFF, and reading it tile by tile over HTTPS took 48
-minutes on a 45 by 57 km area of interest, by which time the Planetary
-Computer's signed URL had expired; the remaining range requests came back with
-partial bodies and GDAL failed with `TIFFReadEncodedTile() failed`. A signed URL
-is valid for about an hour, so the asset is fetched sequentially, well inside
-that window, with four attempts and exponential backoff. **cache=** keeps the
-downloads in a directory of your choosing, where a file already present with the
-expected size is reused; without it they go to a temporary directory that is
-removed at the end of the run.
+In item mode only the part of the swath the current region needs is read. An
+IW GRD band is about 250 km square, while a city-scale region is a few tens of
+kilometres across, so roughly 4 % of the band carries the product and the rest
+would be read, calibrated and discarded by the warp. The scene has no
+geotransform, only a grid of ground control points, so the window is found by
+fitting a second-order polynomial from longitude and latitude to source pixel
+and line over those points and evaluating it along the region's boundary, with
+512 pixels of margin. The fit's own residual on the control points is checked;
+a scene whose geometry it cannot describe falls back to the whole band with a
+warning rather than returning a window in the wrong place. The window is
+reported by **--verbose** and recorded in the provenance JSON, and the
+calibration and noise LUTs are applied at absolute source coordinates, so a
+windowed product is identical to the same rectangle of a whole-band one.
+
+By default the band is then read over `/vsicurl/`, which for a window of this
+size finishes well inside the signed URL's lifetime. **cache=** instead
+downloads each whole band to a directory of your choosing, which is what
+repeated runs over one scene, or an unreliable link, want; a file already
+present at the expected size is reused.
 
 The geometry is the product's own GCP polynomial, warped with
 `gdalwarp -order 1` to the current region. The module does not use SNAP. It
